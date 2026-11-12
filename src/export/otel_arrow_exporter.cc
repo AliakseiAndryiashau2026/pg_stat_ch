@@ -21,6 +21,7 @@ extern "C" {
 
 #include <arrow/array/builder_binary.h>
 #include <arrow/array/builder_dict.h>
+#include <arrow/array/builder_nested.h>
 #include <arrow/array/builder_primitive.h>
 #include <arrow/io/memory.h>
 #include <arrow/ipc/writer.h>
@@ -180,6 +181,9 @@ class OTelArrowExporter : public StatsExporter {
   shared_ptr<Column<uint64_t>> StatHCUInt64(string_view n) final {
     return MakeNum<uint64_t, arrow::UInt64Builder>(n, arrow::uint64());
   }
+  shared_ptr<Column<std::vector<string_view>>> StatHCStringArray(string_view n) final {
+    return MakeListUtf8Sv(n);
+  }
 
   shared_ptr<Column<int64_t>> StatTimestamp(string_view n) final { return MakeTimestamp(n); }
 
@@ -195,6 +199,7 @@ class OTelArrowExporter : public StatsExporter {
   // -- Lifecycle --
   void BeginBatch() final;
   void BeginRow() final;
+  bool EndRow() final;
   bool CommitBatch() final;
 
   // Transport pass-through to the inner OTelExporter.
@@ -300,6 +305,39 @@ class OTelArrowExporter : public StatsExporter {
     size_t* const bytes_;
   };
 
+  // list(utf8) column for StatHCStringArray -- mirrors the OTelExporter's
+  // array_value log attribute (used for relation_namespaces/relation_names/
+  // relation_kinds, e.g. relation_names -> ["foo1","foo3"], namespace kept
+  // in the parallel relation_namespaces array, not inlined here), just
+  // built as an Arrow list instead of an OTLP AnyValue.array_value.
+  class ArrowListUtf8SvColumn : public Column<std::vector<std::string_view>> {
+   public:
+    ArrowListUtf8SvColumn(arrow::ListBuilder* builder, arrow::StringBuilder* value_builder,
+                          size_t* bytes)
+        : builder_(builder), value_builder_(value_builder), bytes_(bytes) {}
+    void Append(const std::vector<std::string_view>& v) final {
+      arrow::Status s = builder_->Append();
+      if (!s.ok()) {
+        LogArrowFailure("Arrow list append", s);
+        return;
+      }
+      *bytes_ += kVarLenOffsetBytes;
+      for (const auto& elem : v) {
+        s = value_builder_->Append(elem.data(), static_cast<int32_t>(elem.size()));
+        if (!s.ok()) {
+          LogArrowFailure("Arrow list element append", s);
+          return;
+        }
+        *bytes_ += elem.size() + kVarLenOffsetBytes;
+      }
+    }
+
+   private:
+    arrow::ListBuilder* const builder_;
+    arrow::StringBuilder* const value_builder_;
+    size_t* const bytes_;
+  };
+
   class ArrowTimestampColumn : public Column<int64_t> {
    public:
     ArrowTimestampColumn(arrow::TimestampBuilder* builder, size_t* bytes)
@@ -349,6 +387,17 @@ class OTelArrowExporter : public StatsExporter {
     slots_.push_back(
         {std::string(name), arrow::field(std::string(name), arrow::utf8()), std::move(builder)});
     return std::make_shared<ArrowUtf8SvColumn>(raw, &bytes_estimate_);
+  }
+  shared_ptr<Column<std::vector<string_view>>> MakeListUtf8Sv(string_view name) {
+    auto value_builder = std::make_shared<arrow::StringBuilder>();
+    auto* raw_value = value_builder.get();
+    auto builder =
+        std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), value_builder);
+    auto* raw = builder.get();
+    slots_.push_back({std::string(name),
+                      arrow::field(std::string(name), arrow::list(arrow::utf8())),
+                      std::move(builder)});
+    return std::make_shared<ArrowListUtf8SvColumn>(raw, raw_value, &bytes_estimate_);
   }
   shared_ptr<Column<int64_t>> MakeTimestamp(string_view name) {
     auto builder =
@@ -472,18 +521,6 @@ void OTelArrowExporter::BeginBatch() {
 }
 
 void OTelArrowExporter::BeginRow() {
-  if (batch_failed_) {
-    return;
-  }
-  // Mid-batch flush at the row boundary: only safe between rows (column
-  // builders are row-aligned), and only meaningful once at least one row is
-  // already accumulated.
-  if (row_count_ > 0 && bytes_estimate_ >= max_block_bytes_) {
-    if (!Flush()) {
-      batch_failed_ = true;
-      return;
-    }
-  }
   ++row_count_;
   // Synthesized columns fire here so the call site doesn't need to know
   // about them.
@@ -496,6 +533,16 @@ void OTelArrowExporter::BeginRow() {
   svc_ver_->Append(service_version_val_);
   host_id_->Append(host_id_val_);
   pod_name_->Append(pod_name_val_);
+}
+
+// Mid-batch flush at the row boundary: only safe between rows (column
+// builders are row-aligned)
+bool OTelArrowExporter::EndRow() {
+  if (bytes_estimate_ >= max_block_bytes_ && !Flush()) {
+    batch_failed_ = true;
+    return false;
+  }
+  return true;
 }
 
 bool OTelArrowExporter::CommitBatch() {

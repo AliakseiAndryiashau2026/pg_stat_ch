@@ -7,6 +7,7 @@
 #include <limits.h>
 
 #include "config/guc.h"
+#include "hooks/relations_budget.h"
 
 // GUC variable storage
 bool psch_enabled = true;
@@ -30,6 +31,7 @@ int psch_otel_log_batch_size = 8192;
 int psch_otel_log_max_bytes = 3 * 1024 * 1024;  // 3 MiB: gRPC default max is 4 MiB
 int psch_otel_log_delay_ms = 100;
 int psch_otel_metric_interval_ms = 5000;
+bool psch_track_labels = false;
 bool psch_debug_force_locked_overflow = false;
 int psch_min_duration_us = 0;
 int psch_normalize_cache_max = 32768;
@@ -39,6 +41,8 @@ bool psch_use_unified_arrow_exporter = false;
 int psch_otel_max_block_bytes = 3 * 1024 * 1024;  // 3 MiB (max: 16 MiB)
 char* psch_extra_attributes = NULL;
 char* psch_debug_arrow_dump_dir = NULL;
+int psch_relations_max_len = 1023;  // bytes, leaves room for the NUL in PSCH_MAX_RELATIONS_LEN=1024
+bool psch_relations_enabled = false;
 
 // Log level options (matches PostgreSQL's server_message_level_options pattern)
 // clang-format off
@@ -406,6 +410,49 @@ void PschInitGuc(void) {
       &psch_debug_arrow_dump_dir,
       "",
       PGC_SIGHUP,
+      0,
+      NULL, NULL, NULL);
+
+  DefineCustomIntVariable(
+      "pg_stat_ch.relations_max_len",
+      "Maximum bytes for the encoded list of tables/views a query touches.",
+      "Mirrors the query-text truncation pattern: the relations blob is a fixed "
+      "backend-local buffer, truncated (not grown) when a query touches enough "
+      "distinct relations to exceed this budget.",
+      &psch_relations_max_len,
+      1023,                              // bootValue
+      PSCH_RELATIONS_HEADER_LEN,         // min -- the header alone must still fit
+      1023,                              // max (PSCH_MAX_RELATIONS_LEN - 1, room for the NUL)
+      PGC_SUSET,
+      0,
+      NULL, NULL, NULL);
+
+  DefineCustomBoolVariable(
+      "pg_stat_ch.relations_enabled",
+      "Collect the relations array (tables/views a query touches).",
+      "When enabled, the background worker resolves each query's touched "
+      "relations via ExecutorCheckPerms_hook and exports them as the "
+      "relation_namespaces/relation_names/relation_kinds/relations_truncated "
+      "columns. Apply the relations schema migrations before enabling. "
+      "PGC_POSTMASTER: the ClickHouse exporter keeps its column set for the "
+      "life of the bgworker, so a runtime change would leave a stale column.",
+      &psch_relations_enabled,
+      false,
+      PGC_POSTMASTER,
+      0,
+      NULL, NULL, NULL);
+
+  DefineCustomBoolVariable(
+      "pg_stat_ch.track_labels",
+      "Extract sqlcommenter labels from query comments.",
+      "When enabled, the background worker parses the /* key='value' */ comment "
+      "that ends each query and exports the pairs as a JSON labels column "
+      "(attribute in OTel). Requires the labels column downstream. "
+      "PGC_POSTMASTER: the ClickHouse exporter keeps its column set for the "
+      "life of the bgworker, so a runtime change would leave a stale column.",
+      &psch_track_labels,
+      false,
+      PGC_POSTMASTER,
       0,
       NULL, NULL, NULL);
 
