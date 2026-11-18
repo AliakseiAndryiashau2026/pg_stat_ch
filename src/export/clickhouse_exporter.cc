@@ -180,6 +180,9 @@ class ClickHouseExporter : public StatsExporter {
   shared_ptr<Column<uint64_t>> StatHCUInt64(string_view name) final {
     return MakeCol<FixedCol<uint64_t>>(name, "UInt64");
   }
+  shared_ptr<Column<std::vector<string_view>>> StatHCStringArray(string_view name) final {
+    return MakeCol<ArrayStringCol>(name);
+  }
 
   shared_ptr<Column<int64_t>> StatTimestamp(string_view name) final {
     return MakeCol<FixedCol<int64_t>>(name, "DateTime64(6)");
@@ -198,6 +201,7 @@ class ClickHouseExporter : public StatsExporter {
     exported_count_ = 0;
   }
   void BeginRow() final { ++exported_count_; }
+  bool EndRow() final { return true; }
   bool CommitBatch() final;
 
   bool EstablishNewConnection() final;
@@ -259,6 +263,41 @@ class ClickHouseExporter : public StatsExporter {
     const std::string name_;
     std::vector<char> bytes_;
     std::vector<uint64_t> offsets_;
+    chc_column col_{};
+  };
+
+  // Array(String) column: same flattened-bytes approach as StringCol, plus
+  // row_offsets_ tracking each row's cumulative element count.
+  class ArrayStringCol : public Column<std::vector<string_view>>, public ChColumn {
+   public:
+    ArrayStringCol(ClickHouseExporter* exp, string_view name) : exp_(exp), name_(name) {}
+    void Append(const std::vector<string_view>& arr) final {
+      for (const auto& s : arr) {
+        bytes_.insert(bytes_.end(), s.data(), s.data() + s.size());
+        value_offsets_.push_back(bytes_.size());
+      }
+      row_offsets_.push_back(value_offsets_.size());
+    }
+    bool Crunch() final {
+      values_col_ = chc_build_string(value_offsets_.data(),
+                                     reinterpret_cast<const uint8_t*>(bytes_.data()),
+                                     value_offsets_.size());
+      col_ = chc_build_array(row_offsets_.data(), row_offsets_.size(), &values_col_);
+      return exp_->AppendColumn(name_, "Array(String)", &col_);
+    }
+    void Clear() final {
+      bytes_.clear();
+      value_offsets_.clear();
+      row_offsets_.clear();
+    }
+
+   private:
+    ClickHouseExporter* const exp_;
+    const std::string name_;
+    std::vector<char> bytes_;
+    std::vector<uint64_t> value_offsets_;
+    std::vector<uint64_t> row_offsets_;
+    chc_column values_col_{};
     chc_column col_{};
   };
 
@@ -657,7 +696,10 @@ bool ClickHouseExporter::EstablishNewConnection() {
     chc_posix_io_init(&posix_io_, &io_, fd_, PschChcCheckCancel, nullptr);
   }
 
+  // We send LZ4, but the server compresses responses with its own
+  // network_compression_method (ZSTD by default on newer ClickHouse).
   chc_lz4_codec_init(&codec_);
+  chc_zstd_codec_init(&codec_);
 
   chc_client_opts opts = {};
   opts.client_name = "pg_stat_ch";

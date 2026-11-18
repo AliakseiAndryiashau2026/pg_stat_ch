@@ -12,6 +12,7 @@
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "jit/jit.h"
+#include "lib/stringinfo.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
 #include "nodes/queryjumble.h"
@@ -21,7 +22,6 @@
 #include "tcop/utility.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
-#include "utils/lsyscache.h"
 #include "utils/timestamp.h"
 
 #include "compat.h"
@@ -29,6 +29,7 @@
 #include "hooks/hooks.h"
 #include "hooks/query_normalize.h"
 #include "hooks/query_normalize_state.h"
+#include "hooks/relations_collect.h"
 #include "hooks/string_utils.h"
 #include "queue/event.h"
 #include "queue/shmem.h"
@@ -169,15 +170,10 @@ static void UnpackSqlState(int sql_state, char* buf) {
   buf[5] = '\0';
 }
 
-static int GetApplicationName(char* buf, int buf_size) {
-  // The application_name GUC is the authoritative live value (the beentry's
-  // st_appname is populated from it, never the other way around).
-  if (application_name != NULL && application_name[0] != '\0') {
-    return (int)(PschCopyTrimmed(buf, buf_size, application_name));
-  }
-
-  buf[0] = '\0';
-  return 0;
+// The application_name GUC is the authoritative live value (the beentry's
+// st_appname is populated from it, never the other way around).
+static int GetApplicationName(char* buf) {
+  return (int)(PschCopyTrimmed(buf, PSCH_MAX_APP_NAME_LEN, application_name));
 }
 
 static int GetClientAddress(char* buf, int buf_size) {
@@ -266,13 +262,10 @@ static void CopyWalUsage(PschEvent* event, const WalUsage* wal) {
 // Initialize PschEvent by zeroing only the fixed-size prefix instead of the full
 // struct (~4.5KB).  After the field reorder in event.h, everything before
 // err_message is fixed-size, so one memset covers the numeric fields, names,
-// client context, and stored lengths. The two large text buffers only need a
-// leading '\0'; later code either overwrites them or leaves len=0.
+// client context, and stored lengths. Text buffers are read by length alone.
 static void InitEventPartial(PschEvent* event) {
   const size_t fixed_prefix_size = offsetof(PschEvent, err_message);
   memset(event, 0, fixed_prefix_size);
-  event->err_message[0] = '\0';
-  event->query[0] = '\0';
 }
 
 static void InitBaseEvent(PschEvent* event, TimestampTz ts_start, bool top_level,
@@ -288,12 +281,11 @@ static void InitBaseEvent(PschEvent* event, TimestampTz ts_start, bool top_level
 }
 
 static void CopyClientContext(PschEvent* event) {
-  event->application_name_len =
-      (uint8)(GetApplicationName(event->application_name, sizeof(event->application_name)));
+  event->application_name_len = (uint8)(GetApplicationName(event->application_name));
 
   EnsureBackendCache();
   if (backend_state.initialized) {
-    memcpy(event->client_addr, backend_state.client_addr, backend_state.client_addr_len + 1);
+    memcpy(event->client_addr, backend_state.client_addr, backend_state.client_addr_len);
     event->client_addr_len = backend_state.client_addr_len;
   } else {
     event->client_addr_len =
@@ -313,6 +305,29 @@ static void CopyQueryText(PschEvent* event, uint64 query_id) {
                             sizeof(event->query), &event->query_len);
 }
 
+// Relations are collected only here, at ExecutorEnd, so only queries that run
+// to completion carry them. A query that errors out (including failures before
+// execution starts, e.g. permission denied) never reaches ExecutorEnd, and its
+// error event (built from ErrorData in CaptureLogEvent) has relations_len = 0.
+// That reads as empty arrays with relations_truncated = false, so an empty list
+// on an error event means "not recorded", not "touched nothing".
+static void CopyRelations(PschEvent* event, QueryDesc* query_desc) {
+  if (!psch_relations_enabled) {
+    event->relations_len = 0;
+    return;
+  }
+
+  MemoryContext oldcxt = MemoryContextSwitchTo(query_desc->estate->es_query_cxt);
+  StringInfoData buf;
+  initStringInfo(&buf);
+  CollectRelations(&buf, query_desc->plannedstmt->rtable, query_desc->plannedstmt->appendRelations);
+  Assert(buf.len <= (int)sizeof(event->relations));
+  event->relations_len = (uint16)Min(buf.len, (int)sizeof(event->relations));
+  memcpy(event->relations, buf.data, event->relations_len);
+  pfree(buf.data);
+  MemoryContextSwitchTo(oldcxt);
+}
+
 // Resolve database and user names, using the session cache when available.
 // Falls back to catalog lookups if cache hasn't been initialized yet (e.g.,
 // emit_log_hook fires before the first executor hook).
@@ -320,9 +335,9 @@ static void ResolveNames(PschEvent* event) {
   EnsureBackendCache();
 
   if (backend_state.initialized) {
-    memcpy(event->datname, backend_state.datname, backend_state.datname_len + 1);
+    memcpy(event->datname, backend_state.datname, backend_state.datname_len);
     event->datname_len = backend_state.datname_len;
-    memcpy(event->username, backend_state.username, backend_state.username_len + 1);
+    memcpy(event->username, backend_state.username, backend_state.username_len);
     event->username_len = backend_state.username_len;
     return;
   }
@@ -401,6 +416,7 @@ static void BuildEventFromQueryDesc(QueryDesc* query_desc, PschEvent* event, int
   CopyParallelWorkerInfo(event, query_desc);
   CopyClientContext(event);
   CopyQueryText(event, query_desc->plannedstmt->queryId);
+  CopyRelations(event, query_desc);
 }
 
 // post_parse_analyze_hook — decide query text at parse time.
@@ -430,23 +446,19 @@ static void PschPostParseAnalyze(ParseState* pstate, Query* query, PschJumbleSta
   // statement before we either normalize literals or store the unchanged text.
   query_text = CleanQuerytext(query_text, &query_loc, &query_len);
 
-  // Allocate the normalized/trimmed text in CurrentMemoryContext (typically the
-  // query context). PschRememberNormalizedQuery copies it into the cache's own
-  // long-lived context, so this allocation can be short-lived.
-  char* exported_query = NULL;
+  // PschRememberNormalizedQuery copies into the cache's own long-lived context,
+  // so normalized text can be allocated in the short-lived query context
   if (jstate != NULL && jstate->clocations_count > 0) {
-    exported_query = PschNormalizeQuery(query_text, query_loc, &query_len, jstate);
-  } else {
-    exported_query = PschCopyTrimmedStatement(query_text, query_len);
-    if (exported_query != NULL) {
-      query_len = (int)(strlen(exported_query));
+    char* normalized = PschNormalizeQuery(query_text, query_loc, &query_len, jstate);
+    if (normalized != NULL) {
+      PschRememberNormalizedQuery(&backend_state.normalize_cache, query->queryId, normalized,
+                                  query_len);
+      pfree(normalized);
     }
-  }
-
-  if (exported_query != NULL) {
-    PschRememberNormalizedQuery(&backend_state.normalize_cache, query->queryId, exported_query,
+  } else if (query_text != NULL && query_len > 0) {
+    PschTrimStatement(&query_text, &query_len);
+    PschRememberNormalizedQuery(&backend_state.normalize_cache, query->queryId, query_text,
                                 query_len);
-    pfree(exported_query);
   }
 }
 

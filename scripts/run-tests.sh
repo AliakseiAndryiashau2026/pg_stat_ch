@@ -110,7 +110,7 @@ run_regress() {
         --outputdir=test/regression/results \
         --temp-instance=test/regression/tmp_check \
         --temp-config=test/regression/pg_stat_ch.conf \
-        basic version guc stats utility buffers cmd_type client_info error_capture drop_database_barrier upgrade
+        basic version guc stats utility buffers cmd_type client_info error_capture drop_database_barrier upgrade relations
 }
 
 # Run TAP tests
@@ -224,7 +224,6 @@ run_clickhouse() {
     log_info "Starting ClickHouse container..."
     ./docker/tls/generate-certs.sh
     docker compose -f docker/docker-compose.test.yml -f docker/docker-compose.tls.yml up -d --wait
-    docker exec -i psch-clickhouse clickhouse-client --multiquery < docker/init/00-schema.sql
     sleep 5  # Extra wait for healthcheck
 
     local perl_lib="${PG_LIB}/pgxs/src/test/perl"

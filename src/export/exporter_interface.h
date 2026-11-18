@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 class StatsExporter {
  protected:
@@ -19,6 +20,15 @@ class StatsExporter {
    public:
     virtual void Append(const T& t) = 0;
     virtual ~Column() = default;
+  };
+
+  // No-op column: the default StatHCStringArray() implementation below
+  // returns this so callers never need a null check, matching the "not every
+  // backend implements every column" pattern SendArrowBatch already uses.
+  template <typename T>
+  class NoopColumn : public Column<T> {
+   public:
+    void Append(const T& /*t*/) final {}
   };
 
  public:
@@ -55,6 +65,14 @@ class StatsExporter {
   virtual shared_ptr<Column<int64_t>> StatHCInt64(string_view name) = 0;
   virtual shared_ptr<Column<uint64_t>> StatHCUInt64(string_view name) = 0;
 
+  // Array-of-strings column. Non-pure with a no-op default so a backend
+  // that doesn't implement it yet simply discards, rather than a pure
+  // virtual forcing every backend to handle it explicitly.
+  virtual shared_ptr<Column<std::vector<string_view>>> StatHCStringArray(string_view name) {
+    (void)name;
+    return std::make_shared<NoopColumn<std::vector<string_view>>>();
+  }
+
   // Domain-specific. Caller appends a Unix-epoch microsecond timestamp.
   // (PG-epoch values must be offset by kPostgresEpochOffsetUs before append;
   // CH DateTime64(6) and OTel time_unix_nano both interpret the wire value
@@ -83,6 +101,7 @@ class StatsExporter {
 
   virtual void BeginBatch() = 0;
   virtual void BeginRow() = 0;
+  virtual bool EndRow() = 0;
   virtual bool CommitBatch() = 0;
 
   virtual bool EstablishNewConnection() = 0;
@@ -126,6 +145,7 @@ void RecordExporterFailure(const char* message);
 //     exporter->BeginRow(); // no-op or initialize tag map
 //     col_user->Append(ev.username);
 //     col_rows->Append(ev.rows);
+//     if (!exporter->EndRow()) break; // false after failed mid-batch flush
 //   }
 //
 //   exporter->CommitBatch();  // Inserts or collects stats

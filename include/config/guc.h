@@ -28,6 +28,7 @@ extern int psch_otel_log_batch_size;
 extern int psch_otel_log_max_bytes;
 extern int psch_otel_log_delay_ms;
 extern int psch_otel_metric_interval_ms;
+extern bool psch_track_labels;
 extern bool psch_debug_force_locked_overflow;
 extern int psch_min_duration_us;
 extern int psch_normalize_cache_max;
@@ -37,6 +38,8 @@ extern bool psch_use_unified_arrow_exporter;
 extern int psch_otel_max_block_bytes;
 extern char* psch_extra_attributes;
 extern char* psch_debug_arrow_dump_dir;
+extern int psch_relations_max_len;
+extern bool psch_relations_enabled;
 
 // Initialize GUC variables
 void PschInitGuc(void);
